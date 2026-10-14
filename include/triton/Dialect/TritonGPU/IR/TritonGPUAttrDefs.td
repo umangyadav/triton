@@ -904,7 +904,6 @@ available on AMD Instinct GPUs of CDNA architectures.
 
 It is characterized by the following parameters:
 - `version`: The GPU architecture:
-  - 1: gfx908: CDNA1
   - 2: gfx90a: CDNA2
   - 3: gfx942: CDNA3
   - 4: gfx950: CDNA4
@@ -1080,7 +1079,7 @@ It is characterized by the following parameters:
 - `version` indicates the GPU architecture:
   - 1: RDNA3; e.g., gfx1100, gfx1101
   - 2: RDNA4; e.g., gfx1200, gfx1201
-  - 3: gfx1250
+  - 3: CDNA5; e.g., gfx1250
 - `ctaLayout` indicates the warp layout in the block. This is a generalization
    compared to previous warp layout representation using warpsPerCTA and tilesPerWarp
    parameters.
@@ -1210,7 +1209,7 @@ warpsPerCTA  = [2, 2], tilesPerWarp = [2, 2]
 but with a different ordering of repetitions.
 
 The motivation for this broader formulation comes from the need to describe swizzled warp
-layouts, which help avoid LDS partition conflicts on architectures such as gfx1250.
+layouts, which help avoid LDS partition conflicts on architectures such as CDNA5.
 A valid example of such swizzled configuration is:
 
 ctaLayout = {reg = [[2, 0]], warps = [[2, 1], [1, 0]]}

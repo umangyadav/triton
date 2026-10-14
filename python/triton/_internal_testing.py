@@ -14,6 +14,7 @@ from typing import Optional, Set, Union
 from dataclasses import dataclass
 from contextlib import contextmanager
 import pytest
+import resource
 
 from triton._compile_warmup_state import is_compile_warmup
 
@@ -149,7 +150,7 @@ def is_hip_rdna4():
     return target is not None and target.backend == 'hip' and 'gfx120' in target.arch
 
 
-def is_hip_gfx1250():
+def is_hip_cdna5():
     target = get_current_target()
     return target is not None and target.backend == 'hip' and 'gfx1250' in target.arch
 
@@ -303,6 +304,12 @@ class ProcessResult:
 def _call_in_process(client_fn, args, kwargs, env, stderr_file, compilation_listener):
     if env is not None:
         os.environ.update(env)
+
+    # By defaul AMD runtime calls abort on device assert.
+    # Following forces hip rutime to skip abort call.
+    if is_hip():
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        os.environ["HIP_SKIP_ABORT_ON_GPU_ERROR"] = "1"
 
     # Capture driver/runtime writes to stderr that bypass Python's file objects.
     with open(stderr_file, "w+b") as tmp_stderr:
