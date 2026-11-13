@@ -40,6 +40,19 @@ void addLocalLoadNoAliasScope(LLVM::AliasAnalysisOpInterface llLoadOp);
 // Attaches the "AsyncCopies" alias scope to llLoadDirectToLdsOp
 void addAsyncCopyAliasScope(LLVM::AliasAnalysisOpInterface llLoadDirectToLdsOp);
 
+// Async loads into LDS mask redundant threads either by branching around the
+// load or by giving them an out-of-range LDS address, which the hardware drops.
+// With the address form every warp still issues the load, including a warp
+// whose data is entirely redundant, so wait counts must count it for all warps.
+// The global load can mask per lane through the address on targets with
+// direct-to-LDS scatter; otherwise only a warp-uniform predicate without a
+// per-lane mask (or `other` values for buffer loads) uses the address form.
+bool globalLoadToLdsMasksViaLdsAddress(bool supportsDirectToLdsScatter,
+                                       bool threadPredIsWarpUniform,
+                                       bool hasMask);
+bool bufferLoadToLdsMasksViaLdsAddress(bool threadPredIsWarpUniform,
+                                       bool hasOther);
+
 // Finds the largest supported vecSize smaller than maxVecSize. Returns 0 if
 // there is none
 unsigned

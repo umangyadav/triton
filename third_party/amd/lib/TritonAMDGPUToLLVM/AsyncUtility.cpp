@@ -136,6 +136,17 @@ void addLocalLoadNoAliasScope(LLVM::AliasAnalysisOpInterface llLoadOp) {
   llLoadOp.setAliasScopes(aliasScopes);
 }
 
+bool globalLoadToLdsMasksViaLdsAddress(bool supportsDirectToLdsScatter,
+                                       bool threadPredIsWarpUniform,
+                                       bool hasMask) {
+  return supportsDirectToLdsScatter || (threadPredIsWarpUniform && !hasMask);
+}
+
+bool bufferLoadToLdsMasksViaLdsAddress(bool threadPredIsWarpUniform,
+                                       bool hasOther) {
+  return threadPredIsWarpUniform && !hasOther;
+}
+
 unsigned
 fitToValidDirectToLdsVecSize(unsigned maxVecSize, unsigned elemBitwidth,
                              const triton::AMD::TargetInfo &targetInfo) {

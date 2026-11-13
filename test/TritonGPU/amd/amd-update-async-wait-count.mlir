@@ -685,25 +685,76 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// Test bug fix: With warp = [[0], [0]] the warp dimension has free variables,
-// so the load should contribute 0 instructions — non-canonical warps skip the
-// load entirely.
+// With warp = [[0], [0]] the warp dimension has free variables. The redundant
+// thread predicate is warp-uniform and the load has no `other` values, so the
+// lowering masks the redundant warps through an out-of-range LDS address. Every
+// warp still issues the load, which counts as 1 instruction.
 
 #linear_warp_free = #ttg.linear<{register = [[0]], lane = [[1], [2], [4], [8], [16], [32]], warp = [[0], [0]], block = []}>
 #shared_simple = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
-  // CHECK-LABEL: warp_free_variable_returns_zero
-  tt.func public @warp_free_variable_returns_zero(
+  // CHECK-LABEL: warp_free_variable_lds_address_mask
+  tt.func public @warp_free_variable_lds_address_mask(
       %ptr: !tt.ptr<i32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
       %offsets: tensor<64xi32, #linear_warp_free>,
       %dest: !ttg.memdesc<64xi32, #shared_simple, #smem, mutable>) {
     %0 = amdg.buffer_load_to_local %ptr[%offsets] into %dest : !tt.ptr<i32>[tensor<64xi32, #linear_warp_free>]  -> <64xi32, #shared_simple, #smem, mutable>
     %1 = ttg.async_commit_group
 
-    // Warp free variable means 0 instructions emitted for this warp config
+    // CHECK: amdg.async_wait {{.*}}num_inst = 1
+    %2 = ttg.async_wait {num = 1 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+// With `other` values the lowering branches around the load for the redundant
+// warps, which then issue nothing, so only a zero count is safe.
+
+#linear_warp_free = #ttg.linear<{register = [[0]], lane = [[1], [2], [4], [8], [16], [32]], warp = [[0], [0]], block = []}>
+#shared_simple = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: warp_free_variable_branch_returns_zero
+  tt.func public @warp_free_variable_branch_returns_zero(
+      %ptr: !tt.ptr<i32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
+      %offsets: tensor<64xi32, #linear_warp_free>,
+      %mask: tensor<64xi1, #linear_warp_free>,
+      %other: tensor<64xi32, #linear_warp_free>,
+      %dest: !ttg.memdesc<64xi32, #shared_simple, #smem, mutable>) {
+    %0 = amdg.buffer_load_to_local %ptr[%offsets] mask = %mask other = %other into %dest : !tt.ptr<i32>[tensor<64xi32, #linear_warp_free>] tensor<64xi32, #linear_warp_free> -> <64xi32, #shared_simple, #smem, mutable>
+    %1 = ttg.async_commit_group
+
     // CHECK: amdg.async_wait {{.*}}num_inst = 0
     %2 = ttg.async_wait {num = 1 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+// A 128x16 i8 tile over 8 warps leaves warps 4-7 redundant. gfx1250 masks
+// global loads into LDS per lane through the LDS address, so all 8 warps issue
+// one b128 load per group and waiting for one outstanding group allows 1.
+
+#blocked_redundant_warps = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [32, 1], warpsPerCTA = [8, 1], order = [1, 0]}>
+#shared_scales = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [128, 16]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: global_copy_redundant_warps_gfx1250
+  tt.func public @global_copy_redundant_warps_gfx1250(
+      %ptrs: tensor<128x16x!tt.ptr<i8>, #blocked_redundant_warps> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 16]> : tensor<2xi32>},
+      %dest0: !ttg.memdesc<128x16xi8, #shared_scales, #smem, mutable>,
+      %dest1: !ttg.memdesc<128x16xi8, #shared_scales, #smem, mutable>) {
+    %0 = ttg.async_copy_global_to_local %ptrs, %dest0 : tensor<128x16x!tt.ptr<i8>, #blocked_redundant_warps> -> <128x16xi8, #shared_scales, #smem, mutable>
+    %1 = ttg.async_commit_group
+    %2 = ttg.async_copy_global_to_local %ptrs, %dest1 : tensor<128x16x!tt.ptr<i8>, #blocked_redundant_warps> -> <128x16xi8, #shared_scales, #smem, mutable>
+    %3 = ttg.async_commit_group
+
+    // CHECK: amdg.async_wait {{.*}}num_inst = 1
+    %4 = ttg.async_wait {num = 1 : i32}
     tt.return
   }
 }

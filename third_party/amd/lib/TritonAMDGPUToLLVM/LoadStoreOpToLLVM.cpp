@@ -1030,7 +1030,8 @@ struct BufferLoadToLocalOpConversion
       // HW will drop the load before fetching the data from global memory so we
       // will not overwrite values. This LDS address is scalar for the whole
       // instruction, so it can only mask threads uniformly across the warp.
-      if (isThreadPredWarpUniform && !hasOther) {
+      if (AMD::bufferLoadToLdsMasksViaLdsAddress(isThreadPredWarpUniform,
+                                                 hasOther)) {
         Value predicatedAddress =
             selectLdsAddressForPredicate(b, threadPred, shmemAddr);
         auto bufferLoadToLds = bufferEmitter.emitLoadToLds(
@@ -1187,8 +1188,9 @@ struct AsyncCopyGlobalToLocalOpConversion
       // Predicate load based on threadPred && swizzledMask
       auto cond = b.and_(threadPred, maybeSwizzledMaskElem);
 
-      if (targetInfo.supportsDirectToLdsScatter() ||
-          (threadPredIsWarpUniform && !hasMask)) {
+      if (AMD::globalLoadToLdsMasksViaLdsAddress(
+              targetInfo.supportsDirectToLdsScatter(), threadPredIsWarpUniform,
+              hasMask)) {
         // For architectures supporting per lane LDS addresses or if the
         // predicate is warp-uniform, mask loads by setting the *shared* address
         // to out of range, the HW will drop the load before fetching the data

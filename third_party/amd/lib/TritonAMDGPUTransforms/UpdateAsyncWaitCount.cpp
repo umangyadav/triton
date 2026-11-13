@@ -1,6 +1,7 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "TritonAMDGPUTransforms/Passes.h"
+#include "amd/lib/TritonAMDGPUToLLVM/AsyncUtility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/TDMUtility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/Utility.h"
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
@@ -250,25 +251,30 @@ static void annotateCompletionScopes(ModuleOp module,
 // Returns the number of async copy instructions for global↔shared transfers.
 // Works for both load (global→shared) and store (shared→global) operations.
 // The calculation is based on data contiguity, mask alignment, and the layout
-// mapping between global and shared memory addresses.
+// mapping between global and shared memory addresses. `redundantWarpsIssue`
+// tells whether the lowering still issues the copy in warps that hold only
+// redundant data.
 int getNumberOfAsyncCopyInstructions(RankedTensorType globalType,
                                      ttg::MemDescType sharedType, Value mask,
                                      int ptrContig, int contigHint,
                                      ModuleAxisInfoAnalysis &axisInfo,
                                      const TargetFeatures &targetFeatures,
-                                     bool isStore) {
+                                     bool isStore, bool redundantWarpsIssue) {
   LinearLayout globalLayout = tt::gpu::toLinearLayout(globalType);
   triton::LinearLayout sharedLayout =
       triton::gpu::toLinearLayoutIgnoringPadding(sharedType);
   LinearLayout globalToSharedLayout =
       globalLayout.invertAndCompose(sharedLayout);
 
-  // If the warp dimension has free variables, not all warps execute this async
-  // copy — the lowering will predicate execution to canonical warps only (via
-  // emitRedundantThreadPredicate + emitBranch). Non-canonical warps branch over
-  // the buffer_load instructions entirely, so their vmcnt is not incremented.
+  // If the warp dimension has free variables and the lowering predicates the
+  // redundant warps with a branch (emitRedundantThreadPredicate + emitBranch),
+  // those warps skip the copy entirely and their counter is not incremented.
+  // The count then differs between warps, so only zero is safe. When the
+  // lowering instead masks them through an out-of-range LDS address, every
+  // warp issues the same instructions and the count below holds for all.
   auto kWarp = StringAttr::get(globalType.getContext(), "warp");
-  if (globalToSharedLayout.getFreeVariableMasks().lookup(kWarp) != 0) {
+  if (!redundantWarpsIssue &&
+      globalToSharedLayout.getFreeVariableMasks().lookup(kWarp) != 0) {
     return 0;
   }
 
@@ -322,27 +328,42 @@ int getOpNumberOfAsyncCopyInstructions(Operation *op,
                                        const TargetFeatures &targetFeatures,
                                        ModuleAxisInfoAnalysis &axisInfo,
                                        bool emitRemarkOnNonAsyncOp) {
+  // Mirrors the lowering, which tests whether the redundant-thread predicate
+  // is uniform across each warp's lanes.
+  auto isWarpUniform = [](RankedTensorType type) {
+    auto kLane = StringAttr::get(type.getContext(), "lane");
+    return tt::gpu::toLinearLayout(type).getFreeVariableMasks().lookup(kLane) ==
+           0;
+  };
   if (auto copyOp = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(op)) {
     int contig = LLVM::AMD::getVectorSize(copyOp.getSrc(), axisInfo);
+    bool redundantWarpsIssue = triton::AMD::globalLoadToLdsMasksViaLdsAddress(
+        targetFeatures.supportsDirectToLdsScatter(),
+        isWarpUniform(copyOp.getSrc().getType()),
+        /*hasMask=*/static_cast<bool>(copyOp.getMask()));
     return getNumberOfAsyncCopyInstructions(
         copyOp.getSrc().getType(), copyOp.getResult().getType(),
         copyOp.getMask(), contig, copyOp.getContiguity(), axisInfo,
-        targetFeatures, /*isStore=*/false);
+        targetFeatures, /*isStore=*/false, redundantWarpsIssue);
   } else if (auto bufferOp = dyn_cast<amdgpu::BufferLoadToLocalOp>(op)) {
     auto ptrType = cast<RankedTensorType>(LLVM::AMD::getPointerTypeWithShape(
         bufferOp.getPtr(), bufferOp.getOffsets()));
     int contig = LLVM::AMD::getVectorSize(bufferOp.getPtr(),
                                           bufferOp.getOffsets(), axisInfo);
+    bool redundantWarpsIssue = triton::AMD::bufferLoadToLdsMasksViaLdsAddress(
+        isWarpUniform(ptrType),
+        /*hasOther=*/static_cast<bool>(bufferOp.getOther()));
     return getNumberOfAsyncCopyInstructions(
         ptrType, bufferOp.getDest().getType(), bufferOp.getMask(), contig,
         bufferOp.getContiguity(), axisInfo, targetFeatures,
-        /*isStore=*/false);
+        /*isStore=*/false, redundantWarpsIssue);
   } else if (auto copyOp = dyn_cast<amdgpu::AsyncCopyLocalToGlobalOp>(op)) {
     int contig = LLVM::AMD::getVectorSize(copyOp.getDst(), axisInfo);
+    // Async stores always branch around redundant warps.
     return getNumberOfAsyncCopyInstructions(
         copyOp.getDst().getType(), copyOp.getSrc().getType(), copyOp.getMask(),
         contig, copyOp.getContiguity(), axisInfo, targetFeatures,
-        /*isStore=*/true);
+        /*isStore=*/true, /*redundantWarpsIssue=*/false);
   } else if (emitRemarkOnNonAsyncOp) {
     SmallVector<mlir::MemoryEffects::EffectInstance> effects;
     if (auto memEffectIface = dyn_cast<MemoryEffectOpInterface>(op))
