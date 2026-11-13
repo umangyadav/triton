@@ -2,7 +2,10 @@ from pathlib import Path
 
 import pytest
 import triton
+import triton.language as tl
 from triton import knobs
+from triton.backends.compiler import GPUTarget
+from triton.compiler import ASTSource
 
 from triton._internal_testing import is_hip
 
@@ -75,6 +78,37 @@ def test_llvm_fn_attrs_override_compiler_attributes(tmp_path):
 
     assert '"amdgpu-expert-scheduling-mode"="true"' in baseline.asm["llir"]
     assert '"amdgpu-expert-scheduling-mode"="false"' in with_attrs.asm["llir"]
+
+
+@triton.jit
+def _clamp_kernel(X, Y, USE_ASM: tl.constexpr):
+    offs = tl.arange(0, 64)
+    x = tl.load(X + offs)
+    if USE_ASM:
+        x = tl.inline_asm_elementwise("v_min_f32 $0, $1, $2", "=v,v,v", [x, 1.0], dtype=tl.float32, is_pure=True,
+                                      pack=1)
+    else:
+        x = tl.minimum(x, 1.0)
+    tl.store(Y + offs, x * 2.0)
+
+
+def test_expert_scheduling_inline_asm_disabled(tmp_path):
+    # Expert scheduling does not track VGPRs written by inline assembly, so it
+    # stays off by default for kernels with inline asm on gfx1250.
+    target = GPUTarget("hip", "gfx1250", 32)
+    signature = {"X": "*fp32", "Y": "*fp32", "USE_ASM": "constexpr"}
+
+    def compile_llir(use_asm):
+        src = ASTSource(fn=_clamp_kernel, signature=signature, constexprs={"USE_ASM": use_asm})
+        return triton.compile(src, target=target).asm["llir"]
+
+    with knobs.amd.scope(), knobs.cache.scope():
+        knobs.cache.dir = str(tmp_path)
+        knobs.amd.use_expert_scheduling = None
+        assert '"amdgpu-expert-scheduling-mode"="true"' in compile_llir(False)
+        assert "amdgpu-expert-scheduling-mode" not in compile_llir(True)
+        knobs.amd.use_expert_scheduling = True
+        assert '"amdgpu-expert-scheduling-mode"="true"' in compile_llir(True)
 
 
 def test_llvm_cl_opts_set_bare_option():

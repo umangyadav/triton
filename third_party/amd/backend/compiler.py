@@ -321,6 +321,17 @@ def is_expert_scheduling_enabled(base_arch):
     return base_arch == "gfx1250"
 
 
+def has_inline_asm(mod):
+    found = False
+
+    def visit(op):
+        nonlocal found
+        found = found or op.get_name() == "tt.elementwise_inline_asm"
+
+    mod.walk(visit)
+    return found
+
+
 def get_llvm_flags(options):
     """LLVM command line flags for every LLVM pipeline run of a compilation.
 
@@ -678,6 +689,14 @@ class HIPBackend(BaseBackend):
     @staticmethod
     def make_llir(src, metadata, options):
         mod = src
+        # LLVM's expert scheduling mode inserts the s_wait_alu dependency waits
+        # itself, from the VALU instructions it can see. A VGPR written by
+        # inline assembly is not tracked, so a later VALU may read it before
+        # the write lands. Unless the mode is requested explicitly, keep the
+        # hardware dependency checks for kernels with inline assembly.
+        expert_scheduling = is_expert_scheduling_enabled(options.base_arch)
+        if knobs.amd.use_expert_scheduling is None and has_inline_asm(mod):
+            expert_scheduling = False
         # TritonGPU -> LLVM-IR (MLIR)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
@@ -821,7 +840,7 @@ class HIPBackend(BaseBackend):
             if len(paths) > 0:
                 llvm.link_extern_libs(llvm_mod, paths)
 
-        if is_expert_scheduling_enabled(options.base_arch):
+        if expert_scheduling:
             # LLVM reads this attribute per function. Apply it after linking so
             # external device-library definitions are covered as well.
             for fn in llvm_mod.get_functions():
